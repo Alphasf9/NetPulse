@@ -9,7 +9,6 @@ built to make the journey of a packet visible --- from a browser,
 through a C++ proxy, into a real-time quota engine, and finally into an
 auditable usage ledger.
 
-`<br/>`{=html}
 
 ![Project
 Status](https://img.shields.io/badge/status-in%20development-8b5cf6?style=for-the-badge)
