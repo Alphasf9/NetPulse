@@ -1,0 +1,29 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: minijio-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis:/scripts
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: minijio-insight
+    ports:
+      - "5540:5540"
+    depends_on:
+      - redis
+    volumes:
+      - insight-data:/data
+
+  # Added in later steps:
+  # node-api  -> ./api   (Express + Socket.IO + BullMQ worker)
+  # Postgres lives on Neon (cloud), so there is no postgres container.
+  # The C++ proxy runs natively on Windows during development (see notes).
+
+volumes:
+  redis-data:
+  insight-data:
