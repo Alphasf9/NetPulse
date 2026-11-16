@@ -1,4 +1,3 @@
-::: {align="center"}
 # ◈ NetPulse
 
 ### Real-Time Internet Usage · Data Quota Enforcement · Bandwidth Control
