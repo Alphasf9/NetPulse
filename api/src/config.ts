@@ -21,4 +21,5 @@ export const config = {
     redisUrl: required('REDIS_URL'),
     apiPort: Number(process.env.API_PORT ?? 3000),
     corsOrigin: process.env.CORS_ORIGIN ?? 'https://localhost:5173',
+    webhookSecret: required('WEBHOOK_SECRET'),
 }
