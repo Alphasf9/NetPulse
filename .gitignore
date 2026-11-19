@@ -5,3 +5,13 @@ build/
 *.exe
 *.obj
 .vscode/
+
+
+# vcpkg generated dependencies
+proxy/vcpkg_installed/
+
+# C++ build outputs
+proxy/src/*.exe
+proxy/src/*.obj
+proxy/src/*.pdb
+proxy/src/*.ilk

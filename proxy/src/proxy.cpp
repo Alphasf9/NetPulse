@@ -1,6 +1,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <hiredis/hiredis.h>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -9,13 +11,15 @@
 #include <ctime>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <memory>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -31,7 +35,7 @@ BOOL WINAPI consoleHandler(DWORD signal)
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT || signal == CTRL_BREAK_EVENT)
     {
         g_stopping = true;
-        return TRUE; // we handle it ourselves; main() drains and exits
+        return TRUE;
     }
     return FALSE;
 }
@@ -44,9 +48,12 @@ int g_idleTimeoutMs = 120000;
 constexpr size_t kMaxHeaderBytes = 16 * 1024;
 constexpr int kFirstRequestTimeoutMs = 10000;
 constexpr int kConnectTimeoutMs = 10000;
-constexpr int kSocketIoTimeoutMs = 60000; // a single send()/recv() must not hang longer than this
+constexpr int kSocketIoTimeoutMs = 60000;
 constexpr int kMaxConnections = 512;
 constexpr int kMaxPerClientIp = 128;
+constexpr int kShutdownSoftWaitMs = 8000;
+constexpr int kShutdownForceWaitMs = 5000;
+constexpr long long kSubscriberCacheMs = 5000; // how long a cached Subscriber is trusted before re-reading Redis
 
 struct Cidr
 {
@@ -56,10 +63,6 @@ struct Cidr
 std::vector<Cidr> g_allowedClients;
 
 // ---------------- Logging ----------------
-//
-// Every line looks like:
-//   [18:42:03] TAG     detail...
-// TAG is fixed-width so columns line up in the console.
 
 std::mutex logMutex;
 
@@ -73,7 +76,6 @@ std::string timestamp()
     return buf;
 }
 
-// Right-pads a tag to a fixed width, e.g. "TUNNEL" -> "TUNNEL  "
 std::string tag(const std::string &t)
 {
     std::string out = t;
@@ -93,22 +95,15 @@ void logEvent(const std::string &tagName, const std::string &detail)
     logRaw(tag(tagName) + detail);
 }
 
-// Human-readable byte counts: 850 B, 2.3 KB, 47.1 MB
 std::string humanBytes(long long n)
 {
     char buf[32];
     if (n < 1024)
-    {
         snprintf(buf, sizeof(buf), "%lld B", n);
-    }
     else if (n < 1024LL * 1024)
-    {
         snprintf(buf, sizeof(buf), "%.1f KB", n / 1024.0);
-    }
     else
-    {
         snprintf(buf, sizeof(buf), "%.1f MB", n / (1024.0 * 1024.0));
-    }
     return buf;
 }
 
@@ -152,13 +147,6 @@ bool isAllowedPort(bool isTunnel, int port)
     return isTunnel ? (port == 443) : (port == 80);
 }
 
-void sendStatus(SOCKET s, const char *status)
-{
-    std::string r = std::string("HTTP/1.1 ") + status +
-                    "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    send(s, r.c_str(), (int)r.size(), 0);
-}
-
 timeval toTimeval(int ms)
 {
     timeval tv;
@@ -173,7 +161,6 @@ int msUntil(Clock::time_point deadline)
     return ms < 0 ? 0 : (int)ms;
 }
 
-// Case-insensitive "does line start with prefix"
 bool startsWithCI(const std::string &line, const std::string &prefix)
 {
     if (line.size() < prefix.size())
@@ -184,11 +171,66 @@ bool startsWithCI(const std::string &line, const std::string &prefix)
     return true;
 }
 
+std::string toLowerCopy(const std::string &s)
+{
+    std::string out = s;
+    for (char &c : out)
+        c = (char)tolower((unsigned char)c);
+    return out;
+}
+
+long long nowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// ---------------- sendAll with a real reason ----------------
+
+enum class SendResult
+{
+    Ok,
+    Closed,
+    Timeout,
+    Error
+};
+
+SendResult sendAllEx(SOCKET s, const char *data, int n)
+{
+    int sent = 0;
+    while (sent < n)
+    {
+        int r = send(s, data + sent, n - sent, 0);
+        if (r > 0)
+        {
+            sent += r;
+            continue;
+        }
+        int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT)
+            return SendResult::Timeout;
+        if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAESHUTDOWN)
+            return SendResult::Closed;
+        return SendResult::Error;
+    }
+    return SendResult::Ok;
+}
+
+bool sendAll(SOCKET s, const char *data, int n)
+{
+    return sendAllEx(s, data, n) == SendResult::Ok;
+}
+
+void sendStatus(SOCKET s, const char *status)
+{
+    std::string r = std::string("HTTP/1.1 ") + status +
+                    "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    if (sendAllEx(s, r.c_str(), (int)r.size()) != SendResult::Ok)
+        logEvent("WARN", std::string("could not fully send status '") + status + "' to client");
+}
+
 // ---------------- Accounting hook ----------------
-//
-// Every byte that crosses the proxy passes through here exactly once.
-// Today it does nothing. This is where the Redis slice check and the
-// 64 kbps throttle will plug in later, without changing the relay loop.
 
 enum class Direction
 {
@@ -198,7 +240,7 @@ enum class Direction
 
 void onBytes(Direction /*dir*/, long long /*n*/)
 {
-    // placeholder for metering
+    // placeholder for metering (Redis slice check / token bucket, next step)
 }
 
 // ---------------- Socket that closes itself (RAII) ----------------
@@ -242,9 +284,11 @@ private:
 
 void applyIoTimeouts(SOCKET s)
 {
-    DWORD t = kSocketIoTimeoutMs; // Windows wants milliseconds as a DWORD here
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof(t));
+    DWORD t = kSocketIoTimeoutMs;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t)) == SOCKET_ERROR)
+        logEvent("WARN", "could not set receive timeout on a socket");
+    if (setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof(t)) == SOCKET_ERROR)
+        logEvent("WARN", "could not set send timeout on a socket");
 }
 
 // ---------------- Connection limits ----------------
@@ -283,6 +327,42 @@ struct SlotGuard
     ~SlotGuard() { releaseSlot(ip); }
 };
 
+// ---------------- Active-socket registry (for shutdown) ----------------
+
+std::mutex g_activeSocketsMutex;
+std::unordered_set<SOCKET> g_activeSockets;
+
+void registerActiveSocket(SOCKET s)
+{
+    std::lock_guard<std::mutex> lock(g_activeSocketsMutex);
+    g_activeSockets.insert(s);
+}
+
+void unregisterActiveSocket(SOCKET s)
+{
+    std::lock_guard<std::mutex> lock(g_activeSocketsMutex);
+    g_activeSockets.erase(s);
+}
+
+void forceShutdownActiveSockets()
+{
+    std::lock_guard<std::mutex> lock(g_activeSocketsMutex);
+    for (SOCKET s : g_activeSockets)
+        shutdown(s, SD_BOTH);
+}
+
+class SocketRegistration
+{
+public:
+    explicit SocketRegistration(SOCKET s) : s_(s) { registerActiveSocket(s_); }
+    ~SocketRegistration() { unregisterActiveSocket(s_); }
+    SocketRegistration(const SocketRegistration &) = delete;
+    SocketRegistration &operator=(const SocketRegistration &) = delete;
+
+private:
+    SOCKET s_;
+};
+
 // ---------------- Destination filtering ----------------
 
 bool isBlockedIPv4(uint32_t ip)
@@ -293,7 +373,7 @@ bool isBlockedIPv4(uint32_t ip)
         int bits;
     };
     static const Range blocked[] = {
-        {0x00000000, 8}, {0x0A000000, 8}, {0x64400000, 10}, {0x7F000000, 8}, {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0A80000, 16}, {0xC6120000, 15}, {0xE0000000, 4}, {0xF0000000, 4}};
+        {0x00000000, 8}, {0x0A000000, 8}, {0x64400000, 10}, {0x7F000000, 8}, {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0000200, 24}, {0xC0A80000, 16}, {0xC6120000, 15}, {0xC6336400, 24}, {0xCB007100, 24}, {0xE0000000, 4}, {0xF0000000, 4}};
     for (const Range &r : blocked)
     {
         uint32_t mask = (r.bits == 0) ? 0u : (0xFFFFFFFFu << (32 - r.bits));
@@ -316,6 +396,7 @@ bool isBlockedAddress(const sockaddr *sa)
         for (int i = 0; i < 10; i++)
             if (b[i] != 0)
                 first10Zero = false;
+
         if (first10Zero && b[10] == 0xFF && b[11] == 0xFF)
         {
             uint32_t v4 = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
@@ -328,13 +409,15 @@ bool isBlockedAddress(const sockaddr *sa)
             if (b[i] != 0)
                 first15Zero = false;
         if (first15Zero && b[15] <= 1)
-            return true; // :: and ::1
+            return true;
         if ((b[0] & 0xFE) == 0xFC)
-            return true; // fc00::/7
+            return true;
         if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
-            return true; // fe80::/10
+            return true;
         if (b[0] == 0xFF)
-            return true; // multicast
+            return true;
+        if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0D && b[3] == 0xB8)
+            return true;
         return false;
     }
     return true;
@@ -394,8 +477,8 @@ enum class ReadResult
 
 struct Head
 {
-    std::string headers;  // up to and including the blank line
-    std::string leftover; // bytes that arrived right behind the headers
+    std::string headers;
+    std::string leftover;
 };
 
 int waitReadable(SOCKET s, int timeoutMs)
@@ -447,12 +530,51 @@ ReadResult readHeaders(SOCKET s, Head &out, int timeoutMs)
     }
 }
 
-// Splits headers into lines (each still ending in \r\n, except we trim it),
-// dropping any Proxy-* header and the request line itself.
-std::vector<std::string> headerLinesWithoutProxy(const std::string &headers)
+// ---------------- Header rewriting ----------------
+
+bool isAlwaysHopByHop(const std::string &lowerName)
 {
-    std::vector<std::string> lines;
-    size_t pos = headers.find("\r\n"); // skip the request line
+    static const char *names[] = {
+        "connection", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailer", "trailers", "upgrade"};
+    for (const char *n : names)
+        if (lowerName == n)
+            return true;
+    return startsWithCI(lowerName, "proxy-");
+}
+
+std::vector<std::string> splitCommaList(const std::string &value)
+{
+    std::vector<std::string> out;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, ','))
+    {
+        size_t b = item.find_first_not_of(" \t");
+        size_t e = item.find_last_not_of(" \t");
+        if (b != std::string::npos)
+            out.push_back(item.substr(b, e - b + 1));
+    }
+    return out;
+}
+
+bool splitHeaderLine(const std::string &line, std::string &lowerName, std::string &value)
+{
+    size_t colon = line.find(':');
+    if (colon == std::string::npos)
+        return false;
+    lowerName = toLowerCopy(line.substr(0, colon));
+    size_t vstart = colon + 1;
+    while (vstart < line.size() && (line[vstart] == ' ' || line[vstart] == '\t'))
+        vstart++;
+    value = line.substr(vstart);
+    return true;
+}
+
+std::vector<std::string> headerLinesForForwarding(const std::string &headers)
+{
+    std::vector<std::string> rawLines;
+    size_t pos = headers.find("\r\n");
     pos += 2;
     while (pos < headers.size())
     {
@@ -462,47 +584,42 @@ std::vector<std::string> headerLinesWithoutProxy(const std::string &headers)
         std::string line = headers.substr(pos, next - pos);
         pos = next + 2;
         if (line.empty())
-            break; // blank line = end of headers
-        if (!startsWithCI(line, "Proxy-"))
-            lines.push_back(line);
+            break;
+        rawLines.push_back(line);
     }
-    return lines;
-}
 
-// ---------------- sendAll with a real reason ----------------
-
-enum class SendResult
-{
-    Ok,
-    Closed,  // peer closed / reset
-    Timeout, // SO_SNDTIMEO fired
-    Error
-};
-
-SendResult sendAllEx(SOCKET s, const char *data, int n)
-{
-    int sent = 0;
-    while (sent < n)
+    std::vector<std::string> extraHopByHop;
+    for (const auto &line : rawLines)
     {
-        int r = send(s, data + sent, n - sent, 0);
-        if (r > 0)
+        std::string name, value;
+        if (splitHeaderLine(line, name, value) && name == "connection")
+            for (const auto &nominated : splitCommaList(value))
+                extraHopByHop.push_back(toLowerCopy(nominated));
+    }
+
+    std::vector<std::string> out;
+    for (const auto &line : rawLines)
+    {
+        std::string name, value;
+        if (!splitHeaderLine(line, name, value))
         {
-            sent += r;
+            out.push_back(line);
             continue;
         }
-        int err = WSAGetLastError();
-        if (err == WSAETIMEDOUT)
-            return SendResult::Timeout;
-        if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAESHUTDOWN)
-            return SendResult::Closed;
-        return SendResult::Error;
+        if (isAlwaysHopByHop(name))
+            continue;
+        bool nominated = false;
+        for (const auto &extra : extraHopByHop)
+            if (extra == name)
+            {
+                nominated = true;
+                break;
+            }
+        if (nominated)
+            continue;
+        out.push_back(line);
     }
-    return SendResult::Ok;
-}
-
-bool sendAll(SOCKET s, const char *data, int n)
-{
-    return sendAllEx(s, data, n) == SendResult::Ok;
+    return out;
 }
 
 // ---------------- Connecting to the destination ----------------
@@ -522,7 +639,11 @@ SOCKET connectWithTimeout(const addrinfo *ai, int timeoutMs)
         return INVALID_SOCKET;
 
     u_long nonBlocking = 1;
-    ioctlsocket(s, FIONBIO, &nonBlocking);
+    if (ioctlsocket(s, FIONBIO, &nonBlocking) == SOCKET_ERROR)
+    {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
 
     if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == SOCKET_ERROR)
     {
@@ -554,16 +675,19 @@ SOCKET connectWithTimeout(const addrinfo *ai, int timeoutMs)
     }
 
     u_long blocking = 0;
-    ioctlsocket(s, FIONBIO, &blocking);
+    if (ioctlsocket(s, FIONBIO, &blocking) == SOCKET_ERROR)
+    {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
     applyIoTimeouts(s);
     return s;
 }
 
-// host may be "example.com", "1.2.3.4", or an IPv6 literal (brackets already stripped)
 Socket connectTo(const std::string &host, const std::string &port, ConnectResult &result)
 {
     addrinfo hints{};
-    hints.ai_family = AF_UNSPEC; // try IPv6 and IPv4
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_NUMERICSERV;
     addrinfo *res = nullptr;
@@ -606,7 +730,7 @@ Socket connectTo(const std::string &host, const std::string &port, ConnectResult
     return s;
 }
 
-// ---------------- Relay (two-way copy with half-close and idle timeout) ----------------
+// ---------------- Relay ----------------
 
 enum class RelayEnd
 {
@@ -668,8 +792,7 @@ RelayEnd relay(SOCKET client, SOCKET server, long long &up, long long &down)
             }
             else
             {
-                SendResult sr = sendAllEx(server, buf, n);
-                if (sr != SendResult::Ok)
+                if (sendAllEx(server, buf, n) != SendResult::Ok)
                     return RelayEnd::ServerGone;
                 up += n;
                 onBytes(Direction::Up, n);
@@ -688,8 +811,7 @@ RelayEnd relay(SOCKET client, SOCKET server, long long &up, long long &down)
             }
             else
             {
-                SendResult sr = sendAllEx(client, buf, n);
-                if (sr != SendResult::Ok)
+                if (sendAllEx(client, buf, n) != SendResult::Ok)
                     return RelayEnd::ClientGone;
                 down += n;
                 onBytes(Direction::Down, n);
@@ -707,10 +829,19 @@ struct Target
     bool isTunnel = false;
     std::string host;
     std::string port;
-    std::string pathForRewrite; // only used for plain HTTP
+    std::string pathForRewrite;
 };
 
-// "www.google.com:443" or "[::1]:443" -> host + port
+bool looksLikeValidHost(const std::string &host)
+{
+    if (host.empty())
+        return false;
+    for (char c : host)
+        if ((unsigned char)c <= 0x20 || c == '/' || c == '\\')
+            return false;
+    return true;
+}
+
 bool splitHostPort(const std::string &hostport, const std::string &defaultPort, std::string &host, std::string &port)
 {
     if (!hostport.empty() && hostport[0] == '[')
@@ -726,7 +857,6 @@ bool splitHostPort(const std::string &hostport, const std::string &defaultPort, 
         return !host.empty();
     }
     size_t colon = hostport.rfind(':');
-    // an IPv6 literal with no brackets and no port has more than one colon
     if (colon != std::string::npos && hostport.find(':') != colon)
     {
         host = hostport;
@@ -745,24 +875,41 @@ Target parseTarget(const std::string &method, const std::string &target)
 
     if (t.isTunnel)
     {
-        t.ok = splitHostPort(target, "443", t.host, t.port);
+        t.ok = splitHostPort(target, "443", t.host, t.port) && looksLikeValidHost(t.host);
         return t;
     }
 
-    if (target.rfind("http://", 0) != 0)
+    if (!startsWithCI(target, "http://"))
         return t;
+
     std::string rest = target.substr(7);
-    size_t slash = rest.find('/');
-    std::string hostport = rest.substr(0, slash);
-    t.pathForRewrite = (slash == std::string::npos) ? "/" : rest.substr(slash);
-    t.ok = splitHostPort(hostport, "80", t.host, t.port);
+    if (rest.empty())
+        return t;
+
+    size_t firstDelim = rest.find_first_of("/?#");
+    std::string authorityCandidate = (firstDelim == std::string::npos) ? rest : rest.substr(0, firstDelim);
+
+    if (authorityCandidate.find('@') != std::string::npos)
+        return t;
+
+    std::string pathAndQuery;
+    if (firstDelim == std::string::npos)
+        pathAndQuery = "/";
+    else if (rest[firstDelim] == '/')
+        pathAndQuery = rest.substr(firstDelim);
+    else
+        pathAndQuery = "/" + rest.substr(firstDelim);
+
+    size_t hashPos = pathAndQuery.find('#');
+    if (hashPos != std::string::npos)
+        pathAndQuery = pathAndQuery.substr(0, hashPos);
+
+    t.pathForRewrite = pathAndQuery;
+    t.ok = splitHostPort(authorityCandidate, "80", t.host, t.port) && looksLikeValidHost(t.host);
     return t;
 }
 
 // ---------------- Connection-end logging guard ----------------
-//
-// Whatever path a connection exits through (normal return, early reject,
-// or an exception caught higher up), this prints exactly one summary line.
 
 class ConnectionGuard
 {
@@ -772,20 +919,14 @@ public:
 
     ~ConnectionGuard()
     {
-        if (reported_)
-            return;
         logEvent(isTunnel_ ? "TUNNEL" : "HTTP",
-                  cleanForLog(host_) + ":" + port_ +
-                      "  up=" + humanBytes(up) +
-                      "  down=" + humanBytes(down) +
-                      "  end=" + reason_);
+                 cleanForLog(host_) + ":" + port_ +
+                     "  up=" + humanBytes(up) +
+                     "  down=" + humanBytes(down) +
+                     "  end=" + reason_);
     }
 
-    void finish(const std::string &reason)
-    {
-        reason_ = reason;
-        reported_ = false; // let the destructor print it once
-    }
+    void finish(const std::string &reason) { reason_ = reason; }
 
     long long up = 0, down = 0;
 
@@ -793,13 +934,64 @@ private:
     std::string host_, port_;
     bool isTunnel_;
     std::string reason_ = "no_connection";
-    bool reported_ = false;
 };
 
-// ---------------- Subscriber registry (skeleton) ----------------
+// ---------------- Redis connection (RAII, one per thread) ----------------
 //
-// The map lock protects ONLY the lookup. Callers keep the shared_ptr and then
-// touch the atomics without any lock, never during recv()/send().
+// ChatGPT's correction #1: a bare thread_local pointer never gets freed when
+// the thread exits. This wrapper's destructor runs automatically at thread
+// exit (that's what thread_local destruction guarantees for an object with
+// a destructor, unlike a plain pointer) and calls redisFree().
+
+class RedisConn
+{
+public:
+    ~RedisConn() { reset(); }
+
+    redisContext *get()
+    {
+        if (ctx_ == nullptr)
+            connect();
+        return ctx_;
+    }
+
+    void dropAndReconnectNextTime()
+    {
+        reset();
+    }
+
+private:
+    void connect()
+    {
+        ctx_ = redisConnect("127.0.0.1", 6379);
+        if (ctx_ == nullptr || ctx_->err)
+        {
+            logEvent("ERROR", std::string("Redis connect failed: ") +
+                                  (ctx_ ? ctx_->errstr : "allocation failed"));
+            reset();
+        }
+    }
+
+    void reset()
+    {
+        if (ctx_ != nullptr)
+        {
+            redisFree(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+    redisContext *ctx_ = nullptr;
+};
+
+thread_local RedisConn t_redis;
+
+// ---------------- Subscriber registry ----------------
+//
+// ChatGPT's correction #2: a cached Subscriber now carries a timestamp. A
+// lookup older than kSubscriberCacheMs re-reads Redis instead of trusting
+// the cache forever. This is a simple TTL, not push-based invalidation —
+// see the note after this block for why that tradeoff is deliberate here.
 
 struct Subscriber
 {
@@ -807,26 +999,157 @@ struct Subscriber
     std::atomic<long long> balanceBytes{0};
     std::atomic<bool> unlimited5g{false};
     std::atomic<bool> on5g{false};
+    std::atomic<long long> lastRefreshedMs{0};
 };
 
 std::mutex g_subscribersMutex;
 std::unordered_map<std::string, std::shared_ptr<Subscriber>> g_subscribers;
 
+// Re-reads the four Redis keys for an already-known msisdn into `sub`.
+// Returns false if Redis is unreachable (sub is left with its old values).
+bool refreshSubscriberFromRedis(redisContext *rc, Subscriber &sub)
+{
+    redisReply *balReply = (redisReply *)redisCommand(rc, "GET user:%s:balance_bytes", sub.msisdn.c_str());
+    if (balReply == nullptr)
+        return false; // connection died mid-call
+    if (balReply->type == REDIS_REPLY_STRING)
+        sub.balanceBytes = std::atoll(balReply->str);
+    freeReplyObject(balReply);
+
+    redisReply *unlReply = (redisReply *)redisCommand(rc, "GET user:%s:unlimited_5g", sub.msisdn.c_str());
+    if (unlReply == nullptr)
+        return false;
+    sub.unlimited5g = (unlReply->type == REDIS_REPLY_STRING && std::string(unlReply->str) == "1");
+    freeReplyObject(unlReply);
+
+    redisReply *ratReply = (redisReply *)redisCommand(rc, "GET user:%s:rat_type", sub.msisdn.c_str());
+    if (ratReply == nullptr)
+        return false;
+    sub.on5g = (ratReply->type == REDIS_REPLY_STRING && std::string(ratReply->str) == "5G_NR");
+    freeReplyObject(ratReply);
+
+    sub.lastRefreshedMs = nowMs();
+    return true;
+}
+
+// ChatGPT's correction #3 lands here, in intent: this function exists so it
+// CAN be called from handleClient — and below, in handleClient, we now
+// actually call it. Looking up a subscriber alone proves nothing without
+// that second half.
 std::shared_ptr<Subscriber> findSubscriberByIp(const std::string &ip)
 {
-    // Next step: ask Redis for "ip:{ip}:msisdn", then find or create the entry.
-    std::lock_guard<std::mutex> lock(g_subscribersMutex);
-    auto it = g_subscribers.find(ip);
-    return (it == g_subscribers.end()) ? nullptr : it->second;
+    std::shared_ptr<Subscriber> cached;
+    {
+        std::lock_guard<std::mutex> lock(g_subscribersMutex);
+        auto it = g_subscribers.find(ip);
+        if (it != g_subscribers.end())
+            cached = it->second;
+    }
+
+    if (cached && (nowMs() - cached->lastRefreshedMs.load()) < kSubscriberCacheMs)
+        return cached; // fresh enough — skip Redis entirely for this call
+
+    redisContext *rc = t_redis.get();
+    if (rc == nullptr)
+        return cached; // Redis unreachable: fall back to whatever we had, even if stale
+
+    if (cached)
+    {
+        // Known msisdn already — just re-read the four live fields.
+        if (!refreshSubscriberFromRedis(rc, *cached))
+            t_redis.dropAndReconnectNextTime();
+        return cached;
+    }
+
+    // First time we've seen this IP: find out which subscriber it belongs to.
+    redisReply *reply = (redisReply *)redisCommand(rc, "GET ip:%s:msisdn", ip.c_str());
+    if (reply == nullptr)
+    {
+        t_redis.dropAndReconnectNextTime();
+        return nullptr;
+    }
+    if (reply->type != REDIS_REPLY_STRING)
+    {
+        freeReplyObject(reply);
+        return nullptr; // this IP was never bound via /api/auth/bind-device
+    }
+    std::string msisdn = reply->str;
+    freeReplyObject(reply);
+
+    auto sub = std::make_shared<Subscriber>();
+    sub->msisdn = msisdn;
+    if (!refreshSubscriberFromRedis(rc, *sub))
+    {
+        t_redis.dropAndReconnectNextTime();
+        return nullptr; // couldn't load their data — treat as "not found" this time
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_subscribersMutex);
+        g_subscribers[ip] = sub;
+    }
+    return sub;
+}
+
+// ---------------- Managed worker threads ----------------
+
+struct Worker
+{
+    std::thread t;
+    std::shared_ptr<std::atomic<bool>> done;
+};
+
+std::mutex g_workersMutex;
+std::vector<Worker> g_workers;
+
+void pruneFinishedWorkers()
+{
+    std::lock_guard<std::mutex> lock(g_workersMutex);
+    for (size_t i = 0; i < g_workers.size();)
+    {
+        if (g_workers[i].done->load())
+        {
+            if (g_workers[i].t.joinable())
+                g_workers[i].t.join();
+            g_workers[i] = std::move(g_workers.back());
+            g_workers.pop_back();
+        }
+        else
+        {
+            i++;
+        }
+    }
+}
+
+void joinAllWorkersBlocking()
+{
+    std::lock_guard<std::mutex> lock(g_workersMutex);
+    for (auto &w : g_workers)
+        if (w.t.joinable())
+            w.t.join();
+    g_workers.clear();
 }
 
 // ---------------- One client connection ----------------
 
-void handleClient(SOCKET rawClient, uint32_t clientIp)
+void handleClient(SOCKET rawClient, uint32_t clientIp, std::string clientIpText)
 {
     SlotGuard slot(clientIp);
     Socket client(rawClient);
+    SocketRegistration clientReg(client.get());
     applyIoTimeouts(client.get());
+
+    // ChatGPT's correction #3, applied: the lookup is now actually invoked,
+    // right as the connection starts. We do NOT enforce anything on the
+    // result yet — that's next, once the Lua slice script is wired in. For
+    // now this just proves identification works end-to-end and logs it.
+    auto sub = findSubscriberByIp(clientIpText);
+    if (sub)
+        logEvent("SUBSCRIBER", sub->msisdn + " balance=" + humanBytes(sub->balanceBytes.load()) +
+                                   " 5g_plan=" + (sub->unlimited5g.load() ? "yes" : "no") +
+                                   " on_5g=" + (sub->on5g.load() ? "yes" : "no"));
+    else
+        logEvent("SUBSCRIBER", "no binding for " + clientIpText);
 
     try
     {
@@ -845,7 +1168,7 @@ void handleClient(SOCKET rawClient, uint32_t clientIp)
             return;
         }
         if (rr != ReadResult::Ok)
-            return; // client closed or errored before sending anything
+            return;
 
         std::string firstLine = head.headers.substr(0, head.headers.find("\r\n"));
         size_t sp1 = firstLine.find(' ');
@@ -892,6 +1215,11 @@ void handleClient(SOCKET rawClient, uint32_t clientIp)
             guard.finish(blocked ? "blocked_destination" : "connect_failed");
             return;
         }
+        SocketRegistration serverReg(server.get());
+
+        long long originalRequestBytes = (long long)(head.headers.size() + head.leftover.size());
+        guard.up = originalRequestBytes;
+        onBytes(Direction::Up, originalRequestBytes);
 
         if (t.isTunnel)
         {
@@ -908,28 +1236,22 @@ void handleClient(SOCKET rawClient, uint32_t clientIp)
                     guard.finish("server_reset");
                     return;
                 }
-                guard.up += (long long)head.leftover.size();
-                onBytes(Direction::Up, (long long)head.leftover.size());
             }
         }
         else
         {
-            // Rewrite "GET http://host/path HTTP/1.1" -> "GET /path HTTP/1.1",
-            // drop Proxy-* headers, and force the origin to close after one reply.
-            std::vector<std::string> lines = headerLinesWithoutProxy(head.headers);
+            std::vector<std::string> lines = headerLinesForForwarding(head.headers);
             std::string rewritten = method + " " + t.pathForRewrite + " HTTP/1.1\r\n";
             for (const auto &line : lines)
                 rewritten += line + "\r\n";
             rewritten += "Connection: close\r\n\r\n";
-            rewritten += head.leftover; // a request body, if any, travels unchanged
+            rewritten += head.leftover;
 
             if (sendAllEx(server.get(), rewritten.data(), (int)rewritten.size()) != SendResult::Ok)
             {
                 guard.finish("server_reset");
                 return;
             }
-            guard.up = (long long)rewritten.size();
-            onBytes(Direction::Up, guard.up);
         }
 
         RelayEnd end = relay(client.get(), server.get(), guard.up, guard.down);
@@ -970,34 +1292,55 @@ int main()
     if (g_allowedClients.empty())
     {
         std::cerr << "ALLOWED_CLIENTS has no valid entries. Refusing to start.\n";
+        WSACleanup();
         return 1;
     }
     std::string bindIp = envOr("PROXY_BIND", "0.0.0.0");
 
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET)
+    {
+        std::cerr << "socket() failed: " << WSAGetLastError() << "\n";
+        WSACleanup();
+        return 1;
+    }
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(8888);
     if (inet_pton(AF_INET, bindIp.c_str(), &addr.sin_addr) != 1)
     {
         std::cerr << "PROXY_BIND is not a valid IPv4 address: " << bindIp << "\n";
+        closesocket(listener);
+        WSACleanup();
         return 1;
     }
 
     if (bind(listener, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
     {
         std::cerr << "bind() failed: " << WSAGetLastError() << "\n";
+        closesocket(listener);
+        WSACleanup();
         return 1;
     }
-    listen(listener, SOMAXCONN);
+
+    if (listen(listener, SOMAXCONN) == SOCKET_ERROR)
+    {
+        std::cerr << "listen() failed: " << WSAGetLastError() << "\n";
+        closesocket(listener);
+        WSACleanup();
+        return 1;
+    }
+
     logEvent("START", "listening on " + bindIp + ":8888  (idle timeout " +
-                           std::to_string(g_idleTimeoutMs / 1000) + "s)");
+                          std::to_string(g_idleTimeoutMs / 1000) + "s)");
     if (g_allowPrivate)
         logEvent("WARN", "ALLOW_PRIVATE_DESTINATIONS=1 (dev mode). Never leave this on.");
 
     while (!g_stopping)
     {
-        // Wake up twice a second so Ctrl+C is noticed even when nobody connects.
+        pruneFinishedWorkers();
+
         fd_set acceptSet;
         FD_ZERO(&acceptSet);
         FD_SET(listener, &acceptSet);
@@ -1023,6 +1366,7 @@ int main()
         uint32_t ip = ntohl(peer.sin_addr.s_addr);
         char ipText[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &peer.sin_addr, ipText, sizeof(ipText));
+        std::string ipTextStr(ipText);
 
         if (!isClientAllowed(ip))
         {
@@ -1040,13 +1384,17 @@ int main()
             continue;
         }
 
+        auto done = std::make_shared<std::atomic<bool>>(false);
         g_activeThreads++;
         try
         {
-            std::thread([client, ip]() {
-                handleClient(client, ip);
-                g_activeThreads--;
-            }).detach();
+            std::thread t([client, ip, ipTextStr, done]()
+                          {
+                handleClient(client, ip, ipTextStr);
+                done->store(true);
+                g_activeThreads--; });
+            std::lock_guard<std::mutex> lock(g_workersMutex);
+            g_workers.push_back(Worker{std::move(t), done});
         }
         catch (const std::exception &e)
         {
@@ -1057,13 +1405,33 @@ int main()
         }
     }
 
-    logEvent("STOP", "shutting down, waiting for " +
-                          std::to_string(g_activeThreads.load()) + " active connection(s)...");
+    logEvent("STOP", "no longer accepting new connections");
     closesocket(listener);
-    for (int waited = 0; g_activeThreads > 0 && waited < 15000; waited += 200)
+
+    for (int waited = 0; g_activeThreads > 0 && waited < kShutdownSoftWaitMs; waited += 200)
+    {
+        pruneFinishedWorkers();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    pruneFinishedWorkers();
+
     if (g_activeThreads > 0)
-        logEvent("STOP", std::to_string(g_activeThreads.load()) + " connection(s) still open, forcing exit");
+    {
+        logEvent("STOP", std::to_string(g_activeThreads.load()) +
+                             " connection(s) still active; shutting down their sockets");
+        forceShutdownActiveSockets();
+
+        for (int waited = 0; g_activeThreads > 0 && waited < kShutdownForceWaitMs; waited += 200)
+        {
+            pruneFinishedWorkers();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        pruneFinishedWorkers();
+    }
+
+    logEvent("STOP", "joining remaining worker threads...");
+    joinAllWorkersBlocking();
+
     logEvent("STOP", "exiting");
     WSACleanup();
     return 0;
