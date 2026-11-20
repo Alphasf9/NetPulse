@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -19,7 +20,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -53,7 +53,10 @@ constexpr int kMaxConnections = 512;
 constexpr int kMaxPerClientIp = 128;
 constexpr int kShutdownSoftWaitMs = 8000;
 constexpr int kShutdownForceWaitMs = 5000;
-constexpr long long kSubscriberCacheMs = 5000; // how long a cached Subscriber is trusted before re-reading Redis
+constexpr long long kSubscriberCacheMs = 5000;
+constexpr long long kSliceBytes = 1048576;       // 1 MB, matches slice.lua ARGV[1]
+constexpr long long kEmptyCooldownMs = 1000;     // while balance is 0, re-check Redis at most this often
+constexpr long long kThrottleBytesPerSec = 8192; // 64 kbps, per your spec
 
 struct Cidr
 {
@@ -79,7 +82,7 @@ std::string timestamp()
 std::string tag(const std::string &t)
 {
     std::string out = t;
-    while (out.size() < 8)
+    while (out.size() < 11)
         out += ' ';
     return out;
 }
@@ -240,7 +243,7 @@ enum class Direction
 
 void onBytes(Direction /*dir*/, long long /*n*/)
 {
-    // placeholder for metering (Redis slice check / token bucket, next step)
+    // placeholder: quota logic lives in checkQuota() below, not here
 }
 
 // ---------------- Socket that closes itself (RAII) ----------------
@@ -373,7 +376,10 @@ bool isBlockedIPv4(uint32_t ip)
         int bits;
     };
     static const Range blocked[] = {
-        {0x00000000, 8}, {0x0A000000, 8}, {0x64400000, 10}, {0x7F000000, 8}, {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0000200, 24}, {0xC0A80000, 16}, {0xC6120000, 15}, {0xC6336400, 24}, {0xCB007100, 24}, {0xE0000000, 4}, {0xF0000000, 4}};
+        {0x00000000, 8}, {0x0A000000, 8}, {0x64400000, 10}, {0x7F000000, 8},
+        {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0000200, 24},
+        {0xC0A80000, 16}, {0xC6120000, 15}, {0xC6336400, 24}, {0xCB007100, 24},
+        {0xE0000000, 4}, {0xF0000000, 4}};
     for (const Range &r : blocked)
     {
         uint32_t mask = (r.bits == 0) ? 0u : (0xFFFFFFFFu << (32 - r.bits));
@@ -730,6 +736,253 @@ Socket connectTo(const std::string &host, const std::string &port, ConnectResult
     return s;
 }
 
+// ---------------- Redis connection (RAII, one per thread) ----------------
+
+class RedisConn
+{
+public:
+    ~RedisConn() { reset(); }
+
+    redisContext *get()
+    {
+        if (ctx_ == nullptr)
+            connect();
+        return ctx_;
+    }
+
+    void dropAndReconnectNextTime()
+    {
+        reset();
+    }
+
+private:
+    void connect()
+    {
+        ctx_ = redisConnect("127.0.0.1", 6379);
+        if (ctx_ == nullptr || ctx_->err)
+        {
+            logEvent("ERROR", std::string("Redis connect failed: ") +
+                                   (ctx_ ? ctx_->errstr : "allocation failed"));
+            reset();
+        }
+    }
+
+    void reset()
+    {
+        if (ctx_ != nullptr)
+        {
+            redisFree(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+    redisContext *ctx_ = nullptr;
+};
+
+thread_local RedisConn t_redis;
+
+// ---------------- Slice script loading ----------------
+
+std::string g_sliceScript;
+
+bool loadSliceScript()
+{
+    std::ifstream f("..\\..\\redis\\slice.lua");
+    if (!f.is_open())
+    {
+        logEvent("ERROR", "could not open ../../redis/slice.lua (check working directory)");
+        return false;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    g_sliceScript = ss.str();
+    return !g_sliceScript.empty();
+}
+
+// ---------------- Subscriber registry ----------------
+
+struct Subscriber
+{
+    std::string msisdn;
+    std::atomic<long long> balanceBytes{0};
+    std::atomic<bool> unlimited5g{false};
+    std::atomic<bool> on5g{false};
+    std::atomic<long long> lastRefreshedMs{0};
+    std::atomic<long long> sliceRemaining{0};
+    std::atomic<long long> emptyUntilMs{0};
+    std::atomic<bool> throttled{false}; // true => enforce the 64 kbps cap on downloads
+};
+
+std::mutex g_subscribersMutex;
+std::unordered_map<std::string, std::shared_ptr<Subscriber>> g_subscribers;
+
+bool refreshSubscriberFromRedis(redisContext *rc, Subscriber &sub)
+{
+    redisReply *balReply = (redisReply *)redisCommand(rc, "GET user:%s:balance_bytes", sub.msisdn.c_str());
+    if (balReply == nullptr)
+        return false;
+    if (balReply->type == REDIS_REPLY_STRING)
+        sub.balanceBytes = std::atoll(balReply->str);
+    freeReplyObject(balReply);
+
+    redisReply *unlReply = (redisReply *)redisCommand(rc, "GET user:%s:unlimited_5g", sub.msisdn.c_str());
+    if (unlReply == nullptr)
+        return false;
+    sub.unlimited5g = (unlReply->type == REDIS_REPLY_STRING && std::string(unlReply->str) == "1");
+    freeReplyObject(unlReply);
+
+    redisReply *ratReply = (redisReply *)redisCommand(rc, "GET user:%s:rat_type", sub.msisdn.c_str());
+    if (ratReply == nullptr)
+        return false;
+    sub.on5g = (ratReply->type == REDIS_REPLY_STRING && std::string(ratReply->str) == "5G_NR");
+    freeReplyObject(ratReply);
+
+    sub.lastRefreshedMs = nowMs();
+
+    // A recharge noticed here (balance now positive, or 5G-unlimited) clears
+    // both the Redis-call cooldown AND the active throttle immediately,
+    // rather than waiting for the subscriber's next slice exhaustion event.
+    if (sub.balanceBytes.load() > 0 || sub.unlimited5g.load())
+    {
+        sub.emptyUntilMs = 0;
+        sub.throttled = false;
+    }
+
+    return true;
+}
+
+std::shared_ptr<Subscriber> findSubscriberByIp(const std::string &ip)
+{
+    std::shared_ptr<Subscriber> cached;
+    {
+        std::lock_guard<std::mutex> lock(g_subscribersMutex);
+        auto it = g_subscribers.find(ip);
+        if (it != g_subscribers.end())
+            cached = it->second;
+    }
+
+    if (cached && (nowMs() - cached->lastRefreshedMs.load()) < kSubscriberCacheMs)
+        return cached;
+
+    redisContext *rc = t_redis.get();
+    if (rc == nullptr)
+        return cached;
+
+    if (cached)
+    {
+        if (!refreshSubscriberFromRedis(rc, *cached))
+            t_redis.dropAndReconnectNextTime();
+        return cached;
+    }
+
+    redisReply *reply = (redisReply *)redisCommand(rc, "GET ip:%s:msisdn", ip.c_str());
+    if (reply == nullptr)
+    {
+        t_redis.dropAndReconnectNextTime();
+        return nullptr;
+    }
+    if (reply->type != REDIS_REPLY_STRING)
+    {
+        freeReplyObject(reply);
+        return nullptr;
+    }
+    std::string msisdn = reply->str;
+    freeReplyObject(reply);
+
+    auto sub = std::make_shared<Subscriber>();
+    sub->msisdn = msisdn;
+    if (!refreshSubscriberFromRedis(rc, *sub))
+    {
+        t_redis.dropAndReconnectNextTime();
+        return nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_subscribersMutex);
+        g_subscribers[ip] = sub;
+    }
+    return sub;
+}
+
+// ---------------- Quota checking + enforcement ----------------
+//
+// Spends from a local RAM counter (sliceRemaining) first, and only calls
+// Redis (slice.lua) when that runs out ("write-behind slicing"). On
+// WouldThrottle, sub->throttled is set to true — relay() reads that flag
+// on the DOWNLOAD path and actually paces sends to ~64 kbps (per your
+// spec: sleep_for, never severing the connection). Upload is NOT paced;
+// it is still logged only — see the design note in relay().
+
+enum class QuotaDecision
+{
+    AllowedLocal,
+    AllowedFresh,
+    WouldThrottle,
+    NoSubscriber,
+    RedisError
+};
+
+QuotaDecision checkQuota(const std::shared_ptr<Subscriber> &sub, long long n)
+{
+    if (!sub)
+        return QuotaDecision::NoSubscriber;
+
+    if (sub->sliceRemaining.load() >= n)
+    {
+        sub->sliceRemaining -= n;
+        return QuotaDecision::AllowedLocal;
+    }
+
+    long long now = nowMs();
+    if (now < sub->emptyUntilMs.load())
+    {
+        sub->throttled = true; // still in the cooldown window: still empty
+        return QuotaDecision::WouldThrottle;
+    }
+
+    redisContext *rc = t_redis.get();
+    if (rc == nullptr)
+        return QuotaDecision::RedisError; // fail OPEN: an infra hiccup never cuts off traffic
+
+    std::string balKey = "user:" + sub->msisdn + ":balance_bytes";
+    std::string ratKey = "user:" + sub->msisdn + ":rat_type";
+    std::string unlKey = "user:" + sub->msisdn + ":unlimited_5g";
+
+    redisReply *reply = (redisReply *)redisCommand(
+        rc, "EVAL %s 3 %s %s %s %lld",
+        g_sliceScript.c_str(), balKey.c_str(), ratKey.c_str(), unlKey.c_str(), kSliceBytes);
+
+    if (reply == nullptr)
+    {
+        t_redis.dropAndReconnectNextTime();
+        return QuotaDecision::RedisError;
+    }
+    if (reply->type != REDIS_REPLY_ARRAY || reply->elements != 2)
+    {
+        logEvent("ERROR", "unexpected slice.lua reply shape");
+        freeReplyObject(reply);
+        return QuotaDecision::RedisError;
+    }
+
+    long long granted = reply->element[0]->integer;
+    long long newBalance = reply->element[1]->integer;
+    freeReplyObject(reply);
+
+    sub->balanceBytes = newBalance;
+
+    if (granted == 0)
+    {
+        sub->emptyUntilMs = now + kEmptyCooldownMs;
+        sub->throttled = true;
+        return QuotaDecision::WouldThrottle;
+    }
+
+    sub->emptyUntilMs = 0;
+    sub->throttled = false; // a fresh grant (recharge, or 5G zero-rating) lifts the throttle
+    sub->sliceRemaining = granted - n;
+    return QuotaDecision::AllowedFresh;
+}
+
 // ---------------- Relay ----------------
 
 enum class RelayEnd
@@ -758,33 +1011,78 @@ const char *relayEndName(RelayEnd e)
     }
 }
 
-RelayEnd relay(SOCKET client, SOCKET server, long long &up, long long &down)
+// Sends `data` (n bytes) to `dest` in ~1-second-worth chunks, sleeping
+// between chunks so the achieved rate is capped at kThrottleBytesPerSec.
+// Per your spec: this throttles, it does NOT drop the connection.
+SendResult sendThrottled(SOCKET dest, const char *data, int n)
+{
+    int sent = 0;
+    while (sent < n)
+    {
+        int chunk = (int)std::min<long long>(kThrottleBytesPerSec, n - sent);
+        Clock::time_point chunkStart = Clock::now();
+
+        SendResult r = sendAllEx(dest, data + sent, chunk);
+        if (r != SendResult::Ok)
+            return r;
+        sent += chunk;
+
+        if (sent < n)
+        {
+            auto elapsed = Clock::now() - chunkStart;
+            auto target = std::chrono::milliseconds(1000);
+            if (elapsed < target)
+                std::this_thread::sleep_for(target - elapsed);
+        }
+    }
+    return SendResult::Ok;
+}
+
+// sub is needed so this can check quota on both directions and enforce the
+// download throttle.
+RelayEnd relay(SOCKET client, SOCKET server,
+               long long &up, long long &down,
+               const std::shared_ptr<Subscriber> &sub)
 {
     char buf[16384];
     bool clientOpen = true;
     bool serverOpen = true;
 
+    bool throttleLoggedUp = false;
+    bool throttleLoggedDown = false;
+
     while (clientOpen || serverOpen)
     {
         fd_set readable;
         FD_ZERO(&readable);
+
         if (clientOpen)
             FD_SET(client, &readable);
+
         if (serverOpen)
             FD_SET(server, &readable);
 
         timeval tv = toTimeval(g_idleTimeoutMs);
+
         int r = select(0, &readable, nullptr, nullptr, &tv);
+
         if (r == 0)
             return RelayEnd::IdleTimeout;
+
         if (r < 0)
             return RelayEnd::Error;
 
+        // =========================================
+        // UPLOAD: Tablet -> Internet Server
+        // (log-only — not paced; see design note below)
+        // =========================================
         if (clientOpen && FD_ISSET(client, &readable))
         {
             int n = recv(client, buf, sizeof(buf), 0);
+
             if (n < 0)
                 return RelayEnd::ClientGone;
+
             if (n == 0)
             {
                 clientOpen = false;
@@ -794,16 +1092,43 @@ RelayEnd relay(SOCKET client, SOCKET server, long long &up, long long &down)
             {
                 if (sendAllEx(server, buf, n) != SendResult::Ok)
                     return RelayEnd::ServerGone;
+
                 up += n;
                 onBytes(Direction::Up, n);
+
+                QuotaDecision qd = checkQuota(sub, n);
+
+                if (qd == QuotaDecision::WouldThrottle)
+                {
+                    if (!throttleLoggedUp)
+                    {
+                        logEvent("QUOTA", sub->msisdn +
+                                               " THROTTLED (upload logged only, not paced), after " +
+                                               humanBytes(up) + " this connection");
+                        throttleLoggedUp = true;
+                    }
+                }
+                else if (qd == QuotaDecision::AllowedFresh)
+                {
+                    logEvent("QUOTA", sub->msisdn +
+                                           " fresh slice granted (upload), balance now " +
+                                           humanBytes(sub->balanceBytes.load()));
+                    throttleLoggedUp = false;
+                }
             }
         }
 
+        // =========================================
+        // DOWNLOAD: Internet Server -> Tablet
+        // (ENFORCED — paced to 64 kbps once throttled)
+        // =========================================
         if (serverOpen && FD_ISSET(server, &readable))
         {
             int n = recv(server, buf, sizeof(buf), 0);
+
             if (n < 0)
                 return RelayEnd::ServerGone;
+
             if (n == 0)
             {
                 serverOpen = false;
@@ -811,13 +1136,44 @@ RelayEnd relay(SOCKET client, SOCKET server, long long &up, long long &down)
             }
             else
             {
-                if (sendAllEx(client, buf, n) != SendResult::Ok)
+                // Check quota BEFORE sending this chunk, so the pacing
+                // decision for THIS chunk is based on current state.
+                QuotaDecision qd = checkQuota(sub, n);
+
+                bool paceThisChunk = (qd == QuotaDecision::WouldThrottle);
+
+
+                SendResult sr = paceThisChunk
+                                     ? sendThrottled(client, buf, n)
+                                     : sendAllEx(client, buf, n);
+
+                if (sr != SendResult::Ok)
                     return RelayEnd::ClientGone;
+
                 down += n;
                 onBytes(Direction::Down, n);
+
+                if (qd == QuotaDecision::WouldThrottle)
+                {
+                    if (!throttleLoggedDown)
+                    {
+                        logEvent("QUOTA", sub->msisdn +
+                                               " THROTTLED to 64 kbps (download), after " +
+                                               humanBytes(down) + " this connection");
+                        throttleLoggedDown = true;
+                    }
+                }
+                else if (qd == QuotaDecision::AllowedFresh)
+                {
+                    logEvent("QUOTA", sub->msisdn +
+                                           " fresh slice granted (download), full speed restored, balance now " +
+                                           humanBytes(sub->balanceBytes.load()));
+                    throttleLoggedDown = false;
+                }
             }
         }
     }
+
     return RelayEnd::Closed;
 }
 
@@ -936,161 +1292,6 @@ private:
     std::string reason_ = "no_connection";
 };
 
-// ---------------- Redis connection (RAII, one per thread) ----------------
-//
-// ChatGPT's correction #1: a bare thread_local pointer never gets freed when
-// the thread exits. This wrapper's destructor runs automatically at thread
-// exit (that's what thread_local destruction guarantees for an object with
-// a destructor, unlike a plain pointer) and calls redisFree().
-
-class RedisConn
-{
-public:
-    ~RedisConn() { reset(); }
-
-    redisContext *get()
-    {
-        if (ctx_ == nullptr)
-            connect();
-        return ctx_;
-    }
-
-    void dropAndReconnectNextTime()
-    {
-        reset();
-    }
-
-private:
-    void connect()
-    {
-        ctx_ = redisConnect("127.0.0.1", 6379);
-        if (ctx_ == nullptr || ctx_->err)
-        {
-            logEvent("ERROR", std::string("Redis connect failed: ") +
-                                  (ctx_ ? ctx_->errstr : "allocation failed"));
-            reset();
-        }
-    }
-
-    void reset()
-    {
-        if (ctx_ != nullptr)
-        {
-            redisFree(ctx_);
-            ctx_ = nullptr;
-        }
-    }
-
-    redisContext *ctx_ = nullptr;
-};
-
-thread_local RedisConn t_redis;
-
-// ---------------- Subscriber registry ----------------
-//
-// ChatGPT's correction #2: a cached Subscriber now carries a timestamp. A
-// lookup older than kSubscriberCacheMs re-reads Redis instead of trusting
-// the cache forever. This is a simple TTL, not push-based invalidation —
-// see the note after this block for why that tradeoff is deliberate here.
-
-struct Subscriber
-{
-    std::string msisdn;
-    std::atomic<long long> balanceBytes{0};
-    std::atomic<bool> unlimited5g{false};
-    std::atomic<bool> on5g{false};
-    std::atomic<long long> lastRefreshedMs{0};
-};
-
-std::mutex g_subscribersMutex;
-std::unordered_map<std::string, std::shared_ptr<Subscriber>> g_subscribers;
-
-// Re-reads the four Redis keys for an already-known msisdn into `sub`.
-// Returns false if Redis is unreachable (sub is left with its old values).
-bool refreshSubscriberFromRedis(redisContext *rc, Subscriber &sub)
-{
-    redisReply *balReply = (redisReply *)redisCommand(rc, "GET user:%s:balance_bytes", sub.msisdn.c_str());
-    if (balReply == nullptr)
-        return false; // connection died mid-call
-    if (balReply->type == REDIS_REPLY_STRING)
-        sub.balanceBytes = std::atoll(balReply->str);
-    freeReplyObject(balReply);
-
-    redisReply *unlReply = (redisReply *)redisCommand(rc, "GET user:%s:unlimited_5g", sub.msisdn.c_str());
-    if (unlReply == nullptr)
-        return false;
-    sub.unlimited5g = (unlReply->type == REDIS_REPLY_STRING && std::string(unlReply->str) == "1");
-    freeReplyObject(unlReply);
-
-    redisReply *ratReply = (redisReply *)redisCommand(rc, "GET user:%s:rat_type", sub.msisdn.c_str());
-    if (ratReply == nullptr)
-        return false;
-    sub.on5g = (ratReply->type == REDIS_REPLY_STRING && std::string(ratReply->str) == "5G_NR");
-    freeReplyObject(ratReply);
-
-    sub.lastRefreshedMs = nowMs();
-    return true;
-}
-
-// ChatGPT's correction #3 lands here, in intent: this function exists so it
-// CAN be called from handleClient — and below, in handleClient, we now
-// actually call it. Looking up a subscriber alone proves nothing without
-// that second half.
-std::shared_ptr<Subscriber> findSubscriberByIp(const std::string &ip)
-{
-    std::shared_ptr<Subscriber> cached;
-    {
-        std::lock_guard<std::mutex> lock(g_subscribersMutex);
-        auto it = g_subscribers.find(ip);
-        if (it != g_subscribers.end())
-            cached = it->second;
-    }
-
-    if (cached && (nowMs() - cached->lastRefreshedMs.load()) < kSubscriberCacheMs)
-        return cached; // fresh enough — skip Redis entirely for this call
-
-    redisContext *rc = t_redis.get();
-    if (rc == nullptr)
-        return cached; // Redis unreachable: fall back to whatever we had, even if stale
-
-    if (cached)
-    {
-        // Known msisdn already — just re-read the four live fields.
-        if (!refreshSubscriberFromRedis(rc, *cached))
-            t_redis.dropAndReconnectNextTime();
-        return cached;
-    }
-
-    // First time we've seen this IP: find out which subscriber it belongs to.
-    redisReply *reply = (redisReply *)redisCommand(rc, "GET ip:%s:msisdn", ip.c_str());
-    if (reply == nullptr)
-    {
-        t_redis.dropAndReconnectNextTime();
-        return nullptr;
-    }
-    if (reply->type != REDIS_REPLY_STRING)
-    {
-        freeReplyObject(reply);
-        return nullptr; // this IP was never bound via /api/auth/bind-device
-    }
-    std::string msisdn = reply->str;
-    freeReplyObject(reply);
-
-    auto sub = std::make_shared<Subscriber>();
-    sub->msisdn = msisdn;
-    if (!refreshSubscriberFromRedis(rc, *sub))
-    {
-        t_redis.dropAndReconnectNextTime();
-        return nullptr; // couldn't load their data — treat as "not found" this time
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_subscribersMutex);
-        g_subscribers[ip] = sub;
-    }
-    return sub;
-}
-
 // ---------------- Managed worker threads ----------------
 
 struct Worker
@@ -1139,15 +1340,12 @@ void handleClient(SOCKET rawClient, uint32_t clientIp, std::string clientIpText)
     SocketRegistration clientReg(client.get());
     applyIoTimeouts(client.get());
 
-    // ChatGPT's correction #3, applied: the lookup is now actually invoked,
-    // right as the connection starts. We do NOT enforce anything on the
-    // result yet — that's next, once the Lua slice script is wired in. For
-    // now this just proves identification works end-to-end and logs it.
     auto sub = findSubscriberByIp(clientIpText);
     if (sub)
         logEvent("SUBSCRIBER", sub->msisdn + " balance=" + humanBytes(sub->balanceBytes.load()) +
-                                   " 5g_plan=" + (sub->unlimited5g.load() ? "yes" : "no") +
-                                   " on_5g=" + (sub->on5g.load() ? "yes" : "no"));
+                                    " 5g_plan=" + (sub->unlimited5g.load() ? "yes" : "no") +
+                                    " on_5g=" + (sub->on5g.load() ? "yes" : "no") +
+                                    " throttled=" + (sub->throttled.load() ? "yes" : "no"));
     else
         logEvent("SUBSCRIBER", "no binding for " + clientIpText);
 
@@ -1254,7 +1452,7 @@ void handleClient(SOCKET rawClient, uint32_t clientIp, std::string clientIpText)
             }
         }
 
-        RelayEnd end = relay(client.get(), server.get(), guard.up, guard.down);
+        RelayEnd end = relay(client.get(), server.get(), guard.up, guard.down, sub);
         guard.finish(relayEndName(end));
     }
     catch (const std::exception &e)
@@ -1276,6 +1474,13 @@ int main()
         return 1;
 
     SetConsoleCtrlHandler(consoleHandler, TRUE);
+
+    if (!loadSliceScript())
+    {
+        std::cerr << "Could not load slice.lua — quota checks will fail.\n";
+        WSACleanup();
+        return 1;
+    }
 
     g_allowPrivate = (envOr("ALLOW_PRIVATE_DESTINATIONS", "0") == "1");
 
@@ -1333,7 +1538,7 @@ int main()
     }
 
     logEvent("START", "listening on " + bindIp + ":8888  (idle timeout " +
-                          std::to_string(g_idleTimeoutMs / 1000) + "s)");
+                           std::to_string(g_idleTimeoutMs / 1000) + "s)");
     if (g_allowPrivate)
         logEvent("WARN", "ALLOW_PRIVATE_DESTINATIONS=1 (dev mode). Never leave this on.");
 
@@ -1418,7 +1623,7 @@ int main()
     if (g_activeThreads > 0)
     {
         logEvent("STOP", std::to_string(g_activeThreads.load()) +
-                             " connection(s) still active; shutting down their sockets");
+                              " connection(s) still active; shutting down their sockets");
         forceShutdownActiveSockets();
 
         for (int waited = 0; g_activeThreads > 0 && waited < kShutdownForceWaitMs; waited += 200)
