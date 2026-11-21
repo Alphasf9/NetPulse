@@ -34,3 +34,16 @@ export const rechargeTransactions = pgTable("recharge_transactions", {
     status: txnStatus("status").default("PENDING").notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
 });
+
+
+
+export const usageCdrs = pgTable("usage_cdrs", {
+    id: serial("id").primaryKey(),
+    msisdn: varchar("msisdn", { length: 15 }).notNull(),
+    ratType: varchar("rat_type", { length: 10 }).notNull(),
+    bytesUp: bigint("bytes_up", { mode: "number" }).notNull(),
+    bytesDown: bigint("bytes_down", { mode: "number" }).notNull(),
+    destinationHost: varchar("destination_host", { length: 255 }).notNull(),
+    endReason: varchar("end_reason", { length: 20 }).notNull(),
+    recordedAt: timestamp("recorded_at").defaultNow().notNull(),
+});

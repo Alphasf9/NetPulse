@@ -50,7 +50,7 @@ constexpr int kFirstRequestTimeoutMs = 10000;
 constexpr int kConnectTimeoutMs = 10000;
 constexpr int kSocketIoTimeoutMs = 60000;
 constexpr int kMaxConnections = 512;
-constexpr int kMaxPerClientIp = 128;
+constexpr int kMaxPerClientIp = 256;
 constexpr int kShutdownSoftWaitMs = 8000;
 constexpr int kShutdownForceWaitMs = 5000;
 constexpr long long kSubscriberCacheMs = 5000;
@@ -376,10 +376,7 @@ bool isBlockedIPv4(uint32_t ip)
         int bits;
     };
     static const Range blocked[] = {
-        {0x00000000, 8}, {0x0A000000, 8}, {0x64400000, 10}, {0x7F000000, 8},
-        {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0000200, 24},
-        {0xC0A80000, 16}, {0xC6120000, 15}, {0xC6336400, 24}, {0xCB007100, 24},
-        {0xE0000000, 4}, {0xF0000000, 4}};
+        {0x00000000, 8}, {0x0A000000, 8}, {0x64400000, 10}, {0x7F000000, 8}, {0xA9FE0000, 16}, {0xAC100000, 12}, {0xC0000000, 24}, {0xC0000200, 24}, {0xC0A80000, 16}, {0xC6120000, 15}, {0xC6336400, 24}, {0xCB007100, 24}, {0xE0000000, 4}, {0xF0000000, 4}};
     for (const Range &r : blocked)
     {
         uint32_t mask = (r.bits == 0) ? 0u : (0xFFFFFFFFu << (32 - r.bits));
@@ -762,7 +759,7 @@ private:
         if (ctx_ == nullptr || ctx_->err)
         {
             logEvent("ERROR", std::string("Redis connect failed: ") +
-                                   (ctx_ ? ctx_->errstr : "allocation failed"));
+                                  (ctx_ ? ctx_->errstr : "allocation failed"));
             reset();
         }
     }
@@ -797,6 +794,30 @@ bool loadSliceScript()
     ss << f.rdbuf();
     g_sliceScript = ss.str();
     return !g_sliceScript.empty();
+}
+
+// ---------------- Live event publishing (Pub/Sub, for the dashboard) ----------------
+
+void publishEvent(const std::string &json)
+{
+    redisContext *rc = t_redis.get();
+    if (rc == nullptr)
+        return; // best-effort — a missed dashboard event never affects traffic
+    redisReply *r = (redisReply *)redisCommand(rc, "PUBLISH telecom:telemetry %s", json.c_str());
+    if (r)
+        freeReplyObject(r);
+}
+
+std::string jsonEscape(const std::string &s)
+{
+    std::string out;
+    for (char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out += '\\';
+        out += c;
+    }
+    return out;
 }
 
 // ---------------- Subscriber registry ----------------
@@ -922,7 +943,7 @@ enum class QuotaDecision
     RedisError
 };
 
-QuotaDecision checkQuota(const std::shared_ptr<Subscriber> &sub, long long n)
+QuotaDecision checkQuota(const std::shared_ptr<Subscriber> &sub, long long n, bool isUpload)
 {
     if (!sub)
         return QuotaDecision::NoSubscriber;
@@ -947,6 +968,8 @@ QuotaDecision checkQuota(const std::shared_ptr<Subscriber> &sub, long long n)
     std::string balKey = "user:" + sub->msisdn + ":balance_bytes";
     std::string ratKey = "user:" + sub->msisdn + ":rat_type";
     std::string unlKey = "user:" + sub->msisdn + ":unlimited_5g";
+    long long previousBalance = sub->balanceBytes.load();
+    bool wasThrottled = sub->throttled.load();
 
     redisReply *reply = (redisReply *)redisCommand(
         rc, "EVAL %s 3 %s %s %s %lld",
@@ -968,18 +991,39 @@ QuotaDecision checkQuota(const std::shared_ptr<Subscriber> &sub, long long n)
     long long newBalance = reply->element[1]->integer;
     freeReplyObject(reply);
 
-    sub->balanceBytes = newBalance;
-
     if (granted == 0)
     {
         sub->emptyUntilMs = now + kEmptyCooldownMs;
+        bool firstExhaustion = !wasThrottled;
         sub->throttled = true;
+        sub->balanceBytes = newBalance;
+
+        if (firstExhaustion)
+        {
+            publishEvent("{\"type\":\"QUOTA_EXHAUSTED\",\"msisdn\":\"" + sub->msisdn +
+                         "\",\"ts\":" + std::to_string(now) + "}");
+            publishEvent("{\"type\":\"THROTTLE_STARTED\",\"msisdn\":\"" + sub->msisdn +
+                         "\",\"ts\":" + std::to_string(now) + "}");
+        }
         return QuotaDecision::WouldThrottle;
     }
 
     sub->emptyUntilMs = 0;
     sub->throttled = false; // a fresh grant (recharge, or 5G zero-rating) lifts the throttle
     sub->sliceRemaining = granted - n;
+    sub->balanceBytes = newBalance;
+
+    publishEvent("{\"type\":\"QUOTA_UPDATE\",\"msisdn\":\"" + sub->msisdn +
+                 "\",\"previousBalance\":" + std::to_string(previousBalance) +
+                 ",\"deducted\":" + std::to_string(previousBalance - newBalance) +
+                 ",\"newBalance\":" + std::to_string(newBalance) +
+                 ",\"direction\":\"" + (isUpload ? "upload" : "download") + "\"" +
+                 ",\"ts\":" + std::to_string(now) + "}");
+
+    if (wasThrottled)
+        publishEvent("{\"type\":\"THROTTLE_STOPPED\",\"msisdn\":\"" + sub->msisdn +
+                     "\",\"ts\":" + std::to_string(now) + "}");
+
     return QuotaDecision::AllowedFresh;
 }
 
@@ -1096,23 +1140,22 @@ RelayEnd relay(SOCKET client, SOCKET server,
                 up += n;
                 onBytes(Direction::Up, n);
 
-                QuotaDecision qd = checkQuota(sub, n);
-
+                QuotaDecision qd = checkQuota(sub, n, /*isUpload=*/true);
                 if (qd == QuotaDecision::WouldThrottle)
                 {
                     if (!throttleLoggedUp)
                     {
                         logEvent("QUOTA", sub->msisdn +
-                                               " THROTTLED (upload logged only, not paced), after " +
-                                               humanBytes(up) + " this connection");
+                                              " THROTTLED (upload logged only, not paced), after " +
+                                              humanBytes(up) + " this connection");
                         throttleLoggedUp = true;
                     }
                 }
                 else if (qd == QuotaDecision::AllowedFresh)
                 {
                     logEvent("QUOTA", sub->msisdn +
-                                           " fresh slice granted (upload), balance now " +
-                                           humanBytes(sub->balanceBytes.load()));
+                                          " fresh slice granted (upload), balance now " +
+                                          humanBytes(sub->balanceBytes.load()));
                     throttleLoggedUp = false;
                 }
             }
@@ -1138,14 +1181,13 @@ RelayEnd relay(SOCKET client, SOCKET server,
             {
                 // Check quota BEFORE sending this chunk, so the pacing
                 // decision for THIS chunk is based on current state.
-                QuotaDecision qd = checkQuota(sub, n);
+                QuotaDecision qd = checkQuota(sub, n, /*isUpload=*/false);
 
                 bool paceThisChunk = (qd == QuotaDecision::WouldThrottle);
 
-
                 SendResult sr = paceThisChunk
-                                     ? sendThrottled(client, buf, n)
-                                     : sendAllEx(client, buf, n);
+                                    ? sendThrottled(client, buf, n)
+                                    : sendAllEx(client, buf, n);
 
                 if (sr != SendResult::Ok)
                     return RelayEnd::ClientGone;
@@ -1158,16 +1200,16 @@ RelayEnd relay(SOCKET client, SOCKET server,
                     if (!throttleLoggedDown)
                     {
                         logEvent("QUOTA", sub->msisdn +
-                                               " THROTTLED to 64 kbps (download), after " +
-                                               humanBytes(down) + " this connection");
+                                              " THROTTLED to 64 kbps (download), after " +
+                                              humanBytes(down) + " this connection");
                         throttleLoggedDown = true;
                     }
                 }
                 else if (qd == QuotaDecision::AllowedFresh)
                 {
                     logEvent("QUOTA", sub->msisdn +
-                                           " fresh slice granted (download), full speed restored, balance now " +
-                                           humanBytes(sub->balanceBytes.load()));
+                                          " fresh slice granted (download), full speed restored, balance now " +
+                                          humanBytes(sub->balanceBytes.load()));
                     throttleLoggedDown = false;
                 }
             }
@@ -1270,16 +1312,46 @@ Target parseTarget(const std::string &method, const std::string &target)
 class ConnectionGuard
 {
 public:
-    ConnectionGuard(std::string host, std::string port, bool isTunnel)
-        : host_(std::move(host)), port_(std::move(port)), isTunnel_(isTunnel) {}
+    ConnectionGuard(std::string host, std::string port, bool isTunnel, std::shared_ptr<Subscriber> sub)
+        : host_(std::move(host)), port_(std::move(port)), isTunnel_(isTunnel), sub_(std::move(sub)) {}
 
     ~ConnectionGuard()
     {
-        logEvent(isTunnel_ ? "TUNNEL" : "HTTP",
-                 cleanForLog(host_) + ":" + port_ +
-                     "  up=" + humanBytes(up) +
-                     "  down=" + humanBytes(down) +
-                     "  end=" + reason_);
+        std::string line = cleanForLog(host_) + ":" + port_ +
+                           "  up=" + humanBytes(up) +
+                           "  down=" + humanBytes(down) +
+                           "  end=" + reason_;
+        logEvent(isTunnel_ ? "TUNNEL" : "HTTP", line);
+
+        if (sub_)
+        {
+            redisContext *rc = t_redis.get();
+            if (rc != nullptr)
+            {
+                std::string json = "{\"msisdn\":\"" + sub_->msisdn + "\","
+                                                                     "\"rat\":\"" +
+                                   (sub_->on5g.load() ? "5G_NR" : "4G_LTE") + "\","
+                                                                              "\"up\":" +
+                                   std::to_string(up) + ","
+                                                        "\"down\":" +
+                                   std::to_string(down) + ","
+                                                          "\"host\":\"" +
+                                   cleanForLog(host_) + "\","
+                                                        "\"end\":\"" +
+                                   reason_ + "\"}";
+                redisReply *r = (redisReply *)redisCommand(rc, "LPUSH cdr:queue %s", json.c_str());
+                if (r)
+                    freeReplyObject(r);
+            }
+
+            publishEvent("{\"type\":\"NETWORK_ACTIVITY\",\"msisdn\":\"" + sub_->msisdn +
+                         "\",\"kind\":\"" + (isTunnel_ ? "TUNNEL" : "HTTP") +
+                         "\",\"host\":\"" + jsonEscape(cleanForLog(host_)) +
+                         "\",\"up\":" + std::to_string(up) +
+                         ",\"down\":" + std::to_string(down) +
+                         ",\"endReason\":\"" + reason_ + "\"" +
+                         ",\"ts\":" + std::to_string(nowMs()) + "}");
+        }
     }
 
     void finish(const std::string &reason) { reason_ = reason; }
@@ -1289,6 +1361,7 @@ public:
 private:
     std::string host_, port_;
     bool isTunnel_;
+    std::shared_ptr<Subscriber> sub_;
     std::string reason_ = "no_connection";
 };
 
@@ -1342,12 +1415,21 @@ void handleClient(SOCKET rawClient, uint32_t clientIp, std::string clientIpText)
 
     auto sub = findSubscriberByIp(clientIpText);
     if (sub)
+    {
+        publishEvent("{\"type\":\"SUBSCRIBER_CONNECTED\",\"msisdn\":\"" + sub->msisdn +
+                     "\",\"balance\":" + std::to_string(sub->balanceBytes.load()) +
+                     ",\"unlimited5g\":" + (sub->unlimited5g.load() ? "true" : "false") +
+                     ",\"on5g\":" + (sub->on5g.load() ? "true" : "false") +
+                     ",\"ts\":" + std::to_string(nowMs()) + "}");
         logEvent("SUBSCRIBER", sub->msisdn + " balance=" + humanBytes(sub->balanceBytes.load()) +
-                                    " 5g_plan=" + (sub->unlimited5g.load() ? "yes" : "no") +
-                                    " on_5g=" + (sub->on5g.load() ? "yes" : "no") +
-                                    " throttled=" + (sub->throttled.load() ? "yes" : "no"));
+                                   " 5g_plan=" + (sub->unlimited5g.load() ? "yes" : "no") +
+                                   " on_5g=" + (sub->on5g.load() ? "yes" : "no") +
+                                   " throttled=" + (sub->throttled.load() ? "yes" : "no"));
+    }
     else
+    {
         logEvent("SUBSCRIBER", "no binding for " + clientIpText);
+    }
 
     try
     {
@@ -1393,7 +1475,7 @@ void handleClient(SOCKET rawClient, uint32_t clientIp, std::string clientIpText)
             return;
         }
 
-        ConnectionGuard guard(t.host, t.port, t.isTunnel);
+        ConnectionGuard guard(t.host, t.port, t.isTunnel, sub);
 
         if (!g_allowPrivate && !isAllowedPort(t.isTunnel, portNum))
         {
@@ -1538,7 +1620,7 @@ int main()
     }
 
     logEvent("START", "listening on " + bindIp + ":8888  (idle timeout " +
-                           std::to_string(g_idleTimeoutMs / 1000) + "s)");
+                          std::to_string(g_idleTimeoutMs / 1000) + "s)");
     if (g_allowPrivate)
         logEvent("WARN", "ALLOW_PRIVATE_DESTINATIONS=1 (dev mode). Never leave this on.");
 
@@ -1623,7 +1705,7 @@ int main()
     if (g_activeThreads > 0)
     {
         logEvent("STOP", std::to_string(g_activeThreads.load()) +
-                              " connection(s) still active; shutting down their sockets");
+                             " connection(s) still active; shutting down their sockets");
         forceShutdownActiveSockets();
 
         for (int waited = 0; g_activeThreads > 0 && waited < kShutdownForceWaitMs; waited += 200)

@@ -1,22 +1,24 @@
 import { Router } from "express";
 import { z } from "zod";
 import { redis } from "../redis/client";
+import { requireAuth } from "../middleware/requireAuth";
 
 export const networkRouter = Router();
 
 const ratSchema = z.object({
-    msisdn: z.string().regex(/^\d{10}$/),
     rat: z.enum(["4G_LTE", "5G_NR"]),
 });
 
-networkRouter.post("/toggle-rat", async (req, res) => {
+// The number comes from the login token, so nobody can switch someone else's network.
+networkRouter.post("/toggle-rat", requireAuth, async (req, res) => {
     const parsed = ratSchema.safeParse(req.body);
     if (!parsed.success) {
         return res.status(422).json({
             error: { code: "VALIDATION_ERROR", message: "Invalid request body", details: parsed.error.issues },
         });
     }
-    const { msisdn, rat } = parsed.data;
+    const { rat } = parsed.data;
+    const { msisdn } = req.auth!;
 
     const hasPlan = await redis.exists(`user:${msisdn}:balance_bytes`);
     if (!hasPlan) {
@@ -26,10 +28,7 @@ networkRouter.post("/toggle-rat", async (req, res) => {
     }
 
     await redis.set(`user:${msisdn}:rat_type`, rat);
-    await redis.publish(
-        "telecom:telemetry",
-        JSON.stringify({ type: "RAT_CHANGED", msisdn, rat, ts: Date.now() })
-    );
+    await redis.publish("telecom:telemetry", JSON.stringify({ type: "RAT_CHANGED", msisdn, rat, ts: Date.now() }));
 
     res.json({ msisdn, rat });
 });
